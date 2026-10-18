@@ -1,0 +1,1191 @@
+use super::*;
+use ::windows::core::{HRESULT, implement};
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicI32, Ordering};
+type Calls = Arc<Mutex<Vec<(i32, u16, Vec<Value>)>>>;
+type Drops = Arc<Mutex<Vec<(u8, std::thread::ThreadId)>>>;
+
+#[implement(IDispatch)]
+struct Fixture {
+    mode: u8,
+    calls: Calls,
+    on_drop: Option<(u8, Drops)>,
+}
+impl Drop for Fixture {
+    fn drop(&mut self) {
+        if let Some((id, drops)) = &self.on_drop {
+            drops
+                .lock()
+                .unwrap()
+                .push((*id, std::thread::current().id()));
+        }
+    }
+}
+impl IDispatch_Impl for Fixture_Impl {
+    fn GetTypeInfoCount(&self) -> ::windows::core::Result<u32> {
+        Ok(0)
+    }
+    fn GetTypeInfo(&self, _: u32, _: u32) -> ::windows::core::Result<ITypeInfo> {
+        Err(::windows::core::Error::from_hresult(HRESULT(
+            0x80004001u32 as i32,
+        )))
+    }
+    fn GetIDsOfNames(
+        &self,
+        _: *const GUID,
+        _: *const PCWSTR,
+        _: u32,
+        _: u32,
+        _: *mut i32,
+    ) -> ::windows::core::Result<()> {
+        unreachable!("DISPID must come from the catalog")
+    }
+    fn Invoke(
+        &self,
+        id: i32,
+        _: *const GUID,
+        _: u32,
+        flags: DISPATCH_FLAGS,
+        params: *const DISPPARAMS,
+        result: *mut VARIANT,
+        ex: *mut EXCEPINFO,
+        arg_error: *mut u32,
+    ) -> ::windows::core::Result<()> {
+        // Fixture is a real local IDispatch implementation. No Control Expert
+        // code, broker or PLC is used in these tests.
+        unsafe {
+            let p = &*params;
+            let args = if p.cArgs == 0 {
+                &[][..]
+            } else {
+                std::slice::from_raw_parts(p.rgvarg, p.cArgs as usize)
+            };
+            if matches!(self.mode, 5 | 6 | 9) && id == 2 && flags == DISPATCH_PROPERTYGET {
+                ptr::write(
+                    result,
+                    VARIANT::from(if self.mode == 6 { "V16.0" } else { "V15.1" }),
+                );
+                return Ok(());
+            }
+            if matches!(self.mode, 5 | 6) && id == 27 && flags == DISPATCH_PROPERTYGET {
+                ptr::write(result, VARIANT::from(0i32));
+                return Ok(());
+            }
+            if self.mode == 7 && id == 2 && flags == DISPATCH_METHOD {
+                let app: IDispatch = Fixture {
+                    mode: 5,
+                    calls: self.calls.clone(),
+                    on_drop: None,
+                }
+                .into();
+                ptr::write(result, dispatch_variant(app));
+                return Ok(());
+            }
+            if self.mode == 1 {
+                assert_eq!(args.len(), 4);
+                for (i, v) in args.iter().enumerate() {
+                    assert_eq!(v.vt(), VARENUM(VT_BYREF.0 | VT_I4.0));
+                    let target = v.Anonymous.Anonymous.Anonymous.plVal;
+                    *target = 100 + i as i32;
+                }
+                ptr::write(result, VARIANT::from("15.1"));
+                return Ok(());
+            }
+            if self.mode == 2 {
+                (*ex).bstrDescription =
+                    ManuallyDrop::new(BSTR::from("Fixture rejected the second argument"));
+                (*ex).bstrSource = ManuallyDrop::new(BSTR::from("fixture"));
+                *arg_error = 0;
+                return Err(::windows::core::Error::from_hresult(HRESULT(
+                    0x80020009u32 as i32,
+                )));
+            }
+            if self.mode == 3 {
+                assert_eq!(p.cNamedArgs, 1);
+                assert_eq!(*p.rgdispidNamedArgs, DISPID_PROPERTYPUT);
+            }
+            if self.mode == 4 {
+                let child: IDispatch = Fixture {
+                    mode: 0,
+                    calls: self.calls.clone(),
+                    on_drop: None,
+                }
+                .into();
+                let object = dispatch_variant(child);
+                let mut unsupported = VARIANT::default();
+                (*unsupported.Anonymous.Anonymous).vt = VT_DECIMAL;
+                let psa = SafeArrayCreateVector(VT_VARIANT, 0, 2);
+                let mut array = VARIANT::default();
+                (*array.Anonymous.Anonymous).vt = VARENUM(VT_ARRAY.0 | VT_VARIANT.0);
+                (*array.Anonymous.Anonymous).Anonymous.parray = psa;
+                SafeArrayPutElement(psa, &0, (&object as *const VARIANT).cast())?;
+                SafeArrayPutElement(psa, &1, (&unsupported as *const VARIANT).cast())?;
+                ptr::write(result, array);
+                return Ok(());
+            }
+            let values = args
+                .iter()
+                .map(|v| match v.vt() {
+                    VT_BSTR => json!(v.Anonymous.Anonymous.Anonymous.bstrVal.to_string()),
+                    VT_I4 => json!(v.Anonymous.Anonymous.Anonymous.lVal),
+                    VT_ERROR => json!({"missing":true}),
+                    _ => Value::Null,
+                })
+                .collect();
+            self.calls.lock().unwrap().push((id, flags.0, values));
+            Ok(())
+        }
+    }
+}
+fn setup(interface: &str, mode: u8) -> (State, String, Calls) {
+    let mut c = Catalog::load(crate::versions::Profile::select("15.1").unwrap()).unwrap();
+    c.interfaces.get_mut(interface).unwrap().guid = format!("{:?}", IDispatch::IID);
+    let mut state = State::new(Arc::new(c));
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let fixture: IDispatch = Fixture {
+        mode: if interface == "UnityProServer.IApplication" && mode == 0 {
+            5
+        } else {
+            mode
+        },
+        calls: calls.clone(),
+        on_drop: None,
+    }
+    .into();
+    let handle = state
+        .store(fixture.cast().unwrap(), Some(interface.into()))
+        .unwrap()["$object"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    (state, handle, calls)
+}
+
+#[implement(IDispatch)]
+struct PolicyApp {
+    project: IDispatch,
+    target: Arc<AtomicI32>,
+    visible: Arc<AtomicI32>,
+    calls: Calls,
+}
+impl IDispatch_Impl for PolicyApp_Impl {
+    fn GetTypeInfoCount(&self) -> ::windows::core::Result<u32> {
+        Ok(0)
+    }
+    fn GetTypeInfo(&self, _: u32, _: u32) -> ::windows::core::Result<ITypeInfo> {
+        unreachable!()
+    }
+    fn GetIDsOfNames(
+        &self,
+        _: *const GUID,
+        _: *const PCWSTR,
+        _: u32,
+        _: u32,
+        _: *mut i32,
+    ) -> ::windows::core::Result<()> {
+        unreachable!()
+    }
+    fn Invoke(
+        &self,
+        id: i32,
+        _: *const GUID,
+        _: u32,
+        flags: DISPATCH_FLAGS,
+        params: *const DISPPARAMS,
+        result: *mut VARIANT,
+        _: *mut EXCEPINFO,
+        _: *mut u32,
+    ) -> ::windows::core::Result<()> {
+        let value = match id {
+            // TargetConnectionClose, TargetConnectionOpen and TargetSendCommand.
+            8 | 14 | 19 => {
+                self.calls.lock().unwrap().push((id, flags.0, Vec::new()));
+                VARIANT::default()
+            }
+            1 => dispatch_variant(self.project.clone()),
+            2 => VARIANT::from("V15.1"),
+            4 => {
+                unsafe {
+                    let params = &*params;
+                    assert_eq!(params.cArgs, 2);
+                    let args = std::slice::from_raw_parts(params.rgvarg, 2);
+                    assert_eq!(args[0].vt(), VT_BSTR);
+                    assert_eq!(BSTR::try_from(&args[0])?.to_string(), "");
+                    assert_eq!(args[1].vt(), VT_I4);
+                    assert_eq!(i32::try_from(&args[1])?, 0);
+                }
+                self.visible.store(1, Ordering::SeqCst);
+                VARIANT::default()
+            }
+            27 => VARIANT::from(self.visible.load(Ordering::SeqCst)),
+            34 => {
+                let target = self.target.load(Ordering::SeqCst);
+                if target < 0 {
+                    return Err(::windows::core::Error::from_hresult(HRESULT(
+                        0x80010108u32 as i32,
+                    )));
+                }
+                VARIANT::from(target)
+            }
+            _ => unreachable!("Unexpected policy probe {id}"),
+        };
+        unsafe {
+            ptr::write(result, value);
+        }
+        Ok(())
+    }
+}
+fn add_policy_app(state: &mut State, target: i32) -> (String, String, Calls, Arc<AtomicI32>) {
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let project: IDispatch = Fixture {
+        mode: 0,
+        calls: calls.clone(),
+        on_drop: None,
+    }
+    .into();
+    let handle = state
+        .store(
+            project.cast().unwrap(),
+            Some("UnityProServer.IProject".into()),
+        )
+        .unwrap()["$object"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let target = Arc::new(AtomicI32::new(target));
+    let app: IDispatch = PolicyApp {
+        project,
+        target: target.clone(),
+        visible: Arc::new(AtomicI32::new(0)),
+        calls: calls.clone(),
+    }
+    .into();
+    let app_handle = state
+        .store(
+            app.cast().unwrap(),
+            Some("UnityProServer.IApplication".into()),
+        )
+        .unwrap()["$object"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    (app_handle, handle, calls, target)
+}
+
+#[test]
+fn headless_creation_rejects_visible_applications_and_viewer_keeps_same_com_session() {
+    let _apartment = Apartment::initialize().unwrap();
+    let mut state = policy_state(ExecutionPolicy::default());
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let project: IDispatch = Fixture {
+        mode: 0,
+        calls: calls.clone(),
+        on_drop: None,
+    }
+    .into();
+    let visible = Arc::new(AtomicI32::new(1));
+    let app: IDispatch = PolicyApp {
+        project,
+        target: Arc::new(AtomicI32::new(0)),
+        visible: visible.clone(),
+        calls: calls.clone(),
+    }
+    .into();
+    assert_eq!(
+        state
+            .store(
+                app.cast().unwrap(),
+                Some("UnityProServer.IApplication".into())
+            )
+            .unwrap_err()
+            .code,
+        "headless_required"
+    );
+    assert!(!state.application_ready());
+    assert_eq!(
+        visible.load(Ordering::SeqCst),
+        1,
+        "must not hide external windows"
+    );
+    visible.store(0, Ordering::SeqCst);
+    let application = state
+        .store(
+            app.cast().unwrap(),
+            Some("UnityProServer.IApplication".into()),
+        )
+        .unwrap()["$object"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let opened = state
+        .run(
+            Action::ViewerOpen {
+                handle: application.clone(),
+            },
+            &Trace::new(1, "test", None),
+        )
+        .unwrap();
+    assert_eq!(opened["same_session"], true);
+    assert_eq!(opened["viewer_mode"], "read_only");
+    assert_eq!(opened["application"]["$object"], application);
+    assert_eq!(visible.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        state.objects.len(),
+        1,
+        "viewer must not create a second application"
+    );
+    // Querying the same application after opening its RO view is still valid.
+    state
+        .run(
+            Action::Query {
+                handle: application.clone(),
+                interface: "UnityProServer.IApplication".into(),
+            },
+            &Trace::new(2, "test", None),
+        )
+        .unwrap();
+    let get_project = state
+        .catalog
+        .prepare("UnityProServer.IApplication.Project:get", &BTreeMap::new())
+        .unwrap();
+    let result = state
+        .call(&application, &get_project, &BTreeMap::new())
+        .unwrap();
+    let project_handle = result["return"]["$object"].as_str().unwrap().to_owned();
+    let args = BTreeMap::from([("arg0".into(), json!("Agent change while viewer is open"))]);
+    let change = state
+        .catalog
+        .prepare("UnityProServer.IProject.Comment:put", &args)
+        .unwrap();
+    state.call(&project_handle, &change, &args).unwrap();
+    assert_eq!(
+        calls.lock().unwrap().len(),
+        1,
+        "agent can still edit through COM"
+    );
+    assert_eq!(
+        state
+            .require_headless(&app.cast().unwrap())
+            .unwrap_err()
+            .code,
+        "headless_required"
+    );
+}
+
+#[test]
+fn editable_viewers_and_alternative_editor_entry_points_are_blocked_even_when_unlocked() {
+    let _apartment = Apartment::initialize().unwrap();
+    let mut state = policy_state(ExecutionPolicy {
+        allow_build: true,
+        allow_plc_connection: true,
+        allow_plc_write: true,
+        ..Default::default()
+    });
+    let (app, project, calls, _) = add_policy_app(&mut state, 0);
+    let id = "UnityProServer.IApplication.DisplayStart:method";
+    for (mode, command) in [
+        (json!(1), ""),
+        (json!("psrHmiReadWrite"), ""),
+        (json!(0), "/anything"),
+    ] {
+        let arguments = BTreeMap::from([
+            ("OptionReadWrite".into(), mode),
+            ("comandLine".into(), json!(command)),
+        ]);
+        let operation = state.catalog.prepare(id, &arguments).unwrap();
+        assert_eq!(
+            state.call(&app, &operation, &arguments).unwrap_err().code,
+            "operation_blocked"
+        );
+    }
+    for id in [
+        "UnityProServer.IApplication.DisplayStartControl:method",
+        "UnityProServer.IApplication.DisplayStartForMultiWriter:method",
+        "UnityProServer.IApplication.SetDisplayPosition:method",
+        "UnityProServer.ISection.DisplayEditor:method",
+    ] {
+        let operation = state.catalog.operation(id).unwrap().clone();
+        assert_eq!(
+            state
+                .call(&app, &operation, &BTreeMap::new())
+                .unwrap_err()
+                .code,
+            "operation_blocked"
+        );
+    }
+    assert!(calls.lock().unwrap().is_empty());
+    assert!(state.viewer_open(&project).is_err());
+    for class_id in ["UnityProServer.Application", "PSExeLib.PSEConnector"] {
+        assert_eq!(
+            state.create(class_id).unwrap_err().code,
+            "operation_blocked"
+        );
+    }
+}
+
+#[test]
+fn unconfirmed_visibility_does_not_enable_the_application_gate() {
+    let _apartment = Apartment::initialize().unwrap();
+    let mut state = policy_state(ExecutionPolicy::default());
+    let app: IDispatch = Fixture {
+        mode: 9,
+        calls: Arc::new(Mutex::new(Vec::new())),
+        on_drop: None,
+    }
+    .into();
+    assert_eq!(
+        state
+            .store(
+                app.cast().unwrap(),
+                Some("UnityProServer.IApplication".into())
+            )
+            .unwrap_err()
+            .code,
+        "headless_required"
+    );
+    assert!(!state.application_ready());
+    assert!(state.objects.is_empty());
+}
+fn policy_state(policy: ExecutionPolicy) -> State {
+    let mut catalog = Catalog::load(crate::versions::Profile::select("15.1").unwrap()).unwrap();
+    for interface in [
+        "UnityProServer.IProject",
+        "UnityProServer.IProject2",
+        "UnityProServer.IApplication",
+    ] {
+        catalog.interfaces.get_mut(interface).unwrap().guid = format!("{:?}", IDispatch::IID);
+    }
+    State::with_policy(Arc::new(catalog), policy)
+}
+fn policy_call(state: &mut State, handle: &str, api: &str) -> Result<Value> {
+    let args = if api.contains("RestoreDataToPLC") {
+        BTreeMap::from([("FileName".into(), json!("fixture.dat"))])
+    } else {
+        BTreeMap::new()
+    };
+    let operation = state.catalog.prepare(api, &args).unwrap();
+    state.run(
+        Action::Call {
+            handle: handle.into(),
+            operation: Box::new(operation),
+            arguments: args,
+        },
+        &Trace::new(1, "test", None),
+    )
+}
+
+#[test]
+fn policy_blocks_build_in_simulation_but_allows_analysis_and_verified_simulator_downloads() {
+    let _apartment = Apartment::initialize().unwrap();
+    let mut state = policy_state(ExecutionPolicy::default());
+    let (_, project, calls, target) = add_policy_app(&mut state, 1);
+    for interface in ["IProject", "IProject2"] {
+        for method in ["Build", "BuildAll"] {
+            assert_eq!(
+                policy_call(
+                    &mut state,
+                    &project,
+                    &format!("UnityProServer.{interface}.{method}:method")
+                )
+                .unwrap_err()
+                .code,
+                "operation_blocked"
+            );
+        }
+        policy_call(
+            &mut state,
+            &project,
+            &format!("UnityProServer.{interface}.Analyze:method"),
+        )
+        .unwrap();
+        for method in ["TransferAllPCtoPLC", "RestoreDataToPLC"] {
+            policy_call(
+                &mut state,
+                &project,
+                &format!("UnityProServer.{interface}.{method}:method"),
+            )
+            .unwrap();
+        }
+    }
+    assert_eq!(calls.lock().unwrap().len(), 6);
+    assert_eq!(
+        state.objects.len(),
+        2,
+        "policy probes must release temporary project references"
+    );
+    for selected in [0, 2, -1] {
+        target.store(selected, Ordering::SeqCst);
+        assert_eq!(
+            policy_call(
+                &mut state,
+                &project,
+                "UnityProServer.IProject.TransferAllPCtoPLC:method"
+            )
+            .unwrap_err()
+            .code,
+            "operation_blocked"
+        );
+    }
+    assert_eq!(
+        calls.lock().unwrap().len(),
+        6,
+        "blocked transfers must not invoke the project"
+    );
+    // A fresh live target check permits simulation again without changing policy.
+    target.store(1, Ordering::SeqCst);
+    policy_call(
+        &mut state,
+        &project,
+        "UnityProServer.IProject.TransferAllPCtoPLC:method",
+    )
+    .unwrap();
+}
+
+#[test]
+fn simulator_in_another_application_does_not_authorize_a_plc_or_unowned_project() {
+    let _apartment = Apartment::initialize().unwrap();
+    let mut state = policy_state(ExecutionPolicy::default());
+    let _other = add_policy_app(&mut state, 1);
+    let (app, project, calls, _) = add_policy_app(&mut state, 0);
+    assert!(
+        policy_call(
+            &mut state,
+            &project,
+            "UnityProServer.IProject.TransferAllPCtoPLC:method"
+        )
+        .is_err()
+    );
+    state
+        .run(
+            Action::Release { handle: app },
+            &Trace::new(1, "test", None),
+        )
+        .unwrap();
+    assert!(state.application_ready()); // The other simulator remains open.
+    assert!(
+        policy_call(
+            &mut state,
+            &project,
+            "UnityProServer.IProject2.TransferAllPCtoPLC:method"
+        )
+        .is_err()
+    );
+    assert!(calls.lock().unwrap().is_empty());
+    assert_eq!(state.objects.len(), 3);
+}
+
+#[test]
+fn explicit_unlocks_are_independent_and_enforced_at_the_com_invocation_boundary() {
+    let _apartment = Apartment::initialize().unwrap();
+    let mut state = policy_state(ExecutionPolicy {
+        allow_build: true,
+        ..Default::default()
+    });
+    let (_, project, calls, _) = add_policy_app(&mut state, 0);
+    policy_call(
+        &mut state,
+        &project,
+        "UnityProServer.IProject.BuildAll:method",
+    )
+    .unwrap();
+    assert!(
+        policy_call(
+            &mut state,
+            &project,
+            "UnityProServer.IProject.TransferAllPCtoPLC:method"
+        )
+        .is_err()
+    );
+    assert_eq!(calls.lock().unwrap().len(), 1);
+    let mut state = policy_state(ExecutionPolicy {
+        allow_plc_write: true,
+        ..Default::default()
+    });
+    let (_, project, calls, _) = add_policy_app(&mut state, 0);
+    policy_call(
+        &mut state,
+        &project,
+        "UnityProServer.IProject2.TransferAllPCtoPLC:method",
+    )
+    .unwrap();
+    assert!(
+        policy_call(
+            &mut state,
+            &project,
+            "UnityProServer.IProject2.Build:method"
+        )
+        .is_err()
+    );
+    assert_eq!(calls.lock().unwrap().len(), 1);
+}
+
+fn app_call(
+    state: &mut State,
+    app: &str,
+    api: &str,
+    args: BTreeMap<String, Value>,
+) -> Result<Value> {
+    let operation = state.catalog.prepare(api, &args).unwrap();
+    state.run(
+        Action::Call {
+            handle: app.into(),
+            operation: Box::new(operation),
+            arguments: args,
+        },
+        &Trace::new(1, "test", None),
+    )
+}
+fn connect(project: &str, target: Value) -> BTreeMap<String, Value> {
+    BTreeMap::from([
+        ("target".into(), target),
+        ("BstrNameReservation".into(), json!("agent")),
+        ("ConnectionMode".into(), json!("psrConnectionModePrimary")),
+        ("pProject".into(), json!({"$object": project})),
+    ])
+}
+fn command(project: &str) -> BTreeMap<String, Value> {
+    BTreeMap::from([
+        ("newPlcCommand".into(), json!("psrPlcCommandRun")),
+        ("pProject".into(), json!({"$object": project})),
+    ])
+}
+const OPEN: &str = "UnityProServer.IApplication.TargetConnectionOpen:method";
+const CLOSE: &str = "UnityProServer.IApplication.TargetConnectionClose:method";
+const SEND: &str = "UnityProServer.IApplication.TargetSendCommand:method";
+
+#[test]
+fn plc_connections_need_an_unlock_but_simulator_connections_do_not() {
+    let _apartment = Apartment::initialize().unwrap();
+    let mut state = policy_state(ExecutionPolicy::default());
+    let (app, project, calls, _) = add_policy_app(&mut state, 1);
+    // An unknown symbolic target is rejected while converting arguments.
+    assert!(app_call(&mut state, &app, OPEN, connect(&project, json!("unknown"))).is_err());
+    for target in [json!("psrConnectToPlc"), json!(0)] {
+        let error = app_call(&mut state, &app, OPEN, connect(&project, target)).unwrap_err();
+        assert_eq!(error.code, "operation_blocked");
+        assert_eq!(
+            error.details.unwrap()["unlock_environment"],
+            "CE_MCP_ALLOW_PLC_CONNECTION=1"
+        );
+    }
+    assert!(calls.lock().unwrap().is_empty());
+    for target in [json!("psrConnectToSimulator"), json!(1)] {
+        app_call(&mut state, &app, OPEN, connect(&project, target)).unwrap();
+    }
+    // A verified simulator also authorizes run-state commands.
+    app_call(&mut state, &app, SEND, command(&project)).unwrap();
+    assert_eq!(
+        calls
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|c| c.0)
+            .collect::<Vec<_>>(),
+        vec![14, 14, 19]
+    );
+}
+
+#[test]
+fn plc_commands_require_a_verified_simulator_or_an_unlock() {
+    let _apartment = Apartment::initialize().unwrap();
+    let mut state = policy_state(ExecutionPolicy::default());
+    let (app, project, calls, target) = add_policy_app(&mut state, 0);
+    for selected in [0, 2, -1] {
+        target.store(selected, Ordering::SeqCst);
+        let error = app_call(&mut state, &app, SEND, command(&project)).unwrap_err();
+        assert_eq!(
+            error.details.unwrap()["unlock_environment"],
+            "CE_MCP_ALLOW_PLC_WRITE=1"
+        );
+    }
+    assert!(calls.lock().unwrap().is_empty());
+    let mut state = policy_state(ExecutionPolicy {
+        allow_plc_write: true,
+        ..Default::default()
+    });
+    let (app, project, calls, _) = add_policy_app(&mut state, 0);
+    app_call(&mut state, &app, SEND, command(&project)).unwrap();
+    assert_eq!(calls.lock().unwrap().len(), 1);
+}
+
+#[test]
+fn a_plc_connection_opened_by_this_server_disables_the_simulator_exemption() {
+    let _apartment = Apartment::initialize().unwrap();
+    let mut state = policy_state(ExecutionPolicy {
+        allow_plc_connection: true,
+        ..Default::default()
+    });
+    let (app, project, calls, target) = add_policy_app(&mut state, 0);
+    app_call(
+        &mut state,
+        &app,
+        OPEN,
+        connect(&project, json!("psrConnectToPlc")),
+    )
+    .unwrap();
+    // Switching SelectTarget back to the simulator does not move the live connection.
+    target.store(1, Ordering::SeqCst);
+    assert!(app_call(&mut state, &app, SEND, command(&project)).is_err());
+    assert!(
+        policy_call(
+            &mut state,
+            &project,
+            "UnityProServer.IProject.TransferAllPCtoPLC:method"
+        )
+        .is_err()
+    );
+    app_call(
+        &mut state,
+        &app,
+        CLOSE,
+        BTreeMap::from([("pProject".into(), json!({"$object": project}))]),
+    )
+    .unwrap();
+    app_call(&mut state, &app, SEND, command(&project)).unwrap();
+    assert_eq!(
+        calls
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|c| c.0)
+            .collect::<Vec<_>>(),
+        vec![14, 8, 19]
+    );
+}
+
+#[test]
+fn restricted_categories_and_process_termination_are_blocked_before_com() {
+    let _apartment = Apartment::initialize().unwrap();
+    let mut state = policy_state(ExecutionPolicy::default());
+    let (app, _, calls, _) = add_policy_app(&mut state, 1);
+    let trace = Trace::new(1, "test", None);
+    for class_id in [
+        "UnitySecurityServer.Security",
+        "APPLICATIONPRIVATElib.ApplicationPrivate",
+        "APPLICATIONFORUNITTESTLib.ApplicationForUnitTest",
+    ] {
+        let error = state
+            .run(
+                Action::Create {
+                    class_id: class_id.into(),
+                },
+                &trace,
+            )
+            .unwrap_err();
+        assert_eq!(error.code, "operation_blocked", "{class_id}");
+    }
+    let error = state
+        .run(
+            Action::Query {
+                handle: app.clone(),
+                interface: "UnitySecurityServer.ISecurity".into(),
+            },
+            &trace,
+        )
+        .unwrap_err();
+    assert_eq!(
+        error.details.unwrap()["unlock_environment"],
+        "CE_MCP_ALLOW_SECURITY_ADMIN=1"
+    );
+    let mut state = policy_state(ExecutionPolicy {
+        allow_build: true,
+        allow_plc_connection: true,
+        allow_plc_write: true,
+        allow_security_admin: true,
+        allow_private_apis: true,
+    });
+    let (app, _, _, _) = add_policy_app(&mut state, 1);
+    // Both live on vtable interfaces, so they are also not invocable; the
+    // policy still rejects them before any COM call.
+    for api in [
+        "PSExeLib.IHealthServerGenMulti.KillProcess:method",
+        "PSExeLib.IPSEActiveConnector.ExitPServer:method",
+    ] {
+        let operation = state.catalog.operation(api).unwrap().clone();
+        let error = state.call(&app, &operation, &BTreeMap::new()).unwrap_err();
+        assert_eq!(error.details.unwrap()["reason"], "process_termination");
+    }
+    assert!(calls.lock().unwrap().is_empty());
+}
+
+#[test]
+fn business_operations_are_blocked_before_com_until_application_is_ready() {
+    let _apartment = Apartment::initialize().unwrap();
+    let (mut state, project, calls) = setup("UnityProServer.IProject", 0);
+    let trace = Trace::new(1, "test", None);
+    let operation = state
+        .catalog
+        .prepare("UnityProServer.IProject.BuildAll:method", &BTreeMap::new())
+        .unwrap();
+    for action in [
+        Action::Call {
+            handle: project.clone(),
+            operation: Box::new(operation.clone()),
+            arguments: BTreeMap::new(),
+        },
+        Action::Query {
+            handle: project.clone(),
+            interface: "UnityProServer.IProject".into(),
+        },
+        Action::Create {
+            class_id: "PSExeLib.PSEConnector".into(),
+        },
+        Action::Create {
+            class_id: "UnityProServer.Application".into(),
+        },
+    ] {
+        let error = state.run(action, &trace).unwrap_err();
+        assert_eq!(error.code, "application_not_ready");
+        assert_eq!(error.details.unwrap()["required_tool"], "ce_session_start");
+    }
+    assert!(calls.lock().unwrap().is_empty());
+    // Inspection and reference cleanup remain available while blocked.
+    assert_eq!(
+        state.run(Action::Objects, &trace).unwrap()["application_ready"],
+        false
+    );
+    state
+        .run(Action::Release { handle: project }, &trace)
+        .unwrap();
+    assert_eq!(
+        state.run(Action::Reset, &trace).unwrap()["released_objects"],
+        0
+    );
+}
+
+#[test]
+fn broker_startup_enables_gate_and_last_application_release_disables_it() {
+    let _apartment = Apartment::initialize().unwrap();
+    let (mut state, broker, _) = setup("UnityProBroker.IPServerBroker", 7);
+    Arc::get_mut(&mut state.catalog)
+        .unwrap()
+        .interfaces
+        .get_mut("UnityProServer.IApplication")
+        .unwrap()
+        .guid = format!("{:?}", IDispatch::IID);
+    let trace = Trace::new(1, "test", None);
+    assert!(!state.application_ready());
+    // Broker diagnostics and startup work without an application reference.
+    let operation = state
+        .catalog
+        .prepare(
+            "UnityProBroker.IPServerBroker.InterfaceVersion:get",
+            &BTreeMap::new(),
+        )
+        .unwrap();
+    state
+        .run(
+            Action::Call {
+                handle: broker.clone(),
+                operation: Box::new(operation),
+                arguments: BTreeMap::new(),
+            },
+            &trace,
+        )
+        .unwrap();
+    let operation = state
+        .catalog
+        .prepare(
+            "UnityProBroker.IPServerBroker.NewApplication:method",
+            &BTreeMap::new(),
+        )
+        .unwrap();
+    let mut apps = Vec::new();
+    for _ in 0..2 {
+        let result = state
+            .run(
+                Action::Call {
+                    handle: broker.clone(),
+                    operation: Box::new(operation.clone()),
+                    arguments: BTreeMap::new(),
+                },
+                &trace,
+            )
+            .unwrap();
+        apps.push(result["return"]["$object"].as_str().unwrap().to_owned());
+    }
+    assert!(state.application_ready());
+    let version = state
+        .catalog
+        .prepare("UnityProServer.IApplication.Version:get", &BTreeMap::new())
+        .unwrap();
+    let result = state
+        .run(
+            Action::Call {
+                handle: apps[0].clone(),
+                operation: Box::new(version.clone()),
+                arguments: BTreeMap::new(),
+            },
+            &trace,
+        )
+        .unwrap();
+    assert_eq!(result["return"], "V15.1");
+    state
+        .run(
+            Action::Release {
+                handle: apps[0].clone(),
+            },
+            &trace,
+        )
+        .unwrap();
+    assert!(state.application_ready());
+    state
+        .run(
+            Action::Release {
+                handle: apps[1].clone(),
+            },
+            &trace,
+        )
+        .unwrap();
+    assert!(!state.application_ready());
+    assert_eq!(
+        state
+            .run(
+                Action::Call {
+                    handle: apps[1].clone(),
+                    operation: Box::new(version),
+                    arguments: BTreeMap::new()
+                },
+                &trace
+            )
+            .unwrap_err()
+            .code,
+        "application_not_ready"
+    );
+    // A remaining broker does not keep the application gate open.
+    assert_eq!(state.objects.len(), 1);
+}
+
+#[test]
+fn incompatible_application_never_enables_gate_and_reset_closes_it() {
+    let _apartment = Apartment::initialize().unwrap();
+    let (mut state, _, calls) = setup("UnityProServer.IApplication", 0);
+    assert!(state.application_ready());
+    state
+        .run(Action::Reset, &Trace::new(1, "test", None))
+        .unwrap();
+    assert!(!state.application_ready());
+    let incompatible: IDispatch = Fixture {
+        mode: 6,
+        calls,
+        on_drop: None,
+    }
+    .into();
+    let error = state
+        .store(
+            incompatible.cast().unwrap(),
+            Some("UnityProServer.IApplication".into()),
+        )
+        .unwrap_err();
+    assert_eq!(error.code, "version_mismatch");
+    assert!(!state.application_ready());
+    assert!(state.objects.is_empty());
+}
+#[test]
+fn invokes_with_reversed_arguments_and_symbolic_enums() {
+    let _apartment = Apartment::initialize().unwrap();
+    let (mut s, h, calls) = setup("UnityProServer.ISections", 0);
+    let op = s
+        .catalog
+        .operation("UnityProServer.ISections.Add:method")
+        .unwrap()
+        .clone();
+    let e = s.catalog.enums["UnityProServer.epsrLanguage"]["values"][0].clone();
+    s.call(
+        &h,
+        &op,
+        &BTreeMap::from([
+            ("SectionName".into(), json!("Test")),
+            ("Language".into(), e["name"].clone()),
+        ]),
+    )
+    .unwrap();
+    assert_eq!(
+        calls.lock().unwrap()[0].2,
+        vec![e["value"].clone(), json!("Test")]
+    );
+}
+#[test]
+fn out_arguments_are_real_byrefs_and_appear_in_outputs() {
+    let _apartment = Apartment::initialize().unwrap();
+    let (mut s, h, _) = setup("UnityProServer.IProject", 1);
+    let op = s
+        .catalog
+        .operation("UnityProServer.IProject.GetVersion:method")
+        .unwrap()
+        .clone();
+    let result = s.call(&h, &op, &BTreeMap::new()).unwrap();
+    assert_eq!(result["return"], "15.1");
+    assert_eq!(result["outputs"]["plMinorVersion"], 100);
+    assert_eq!(result["outputs"]["plVersionAutoIncrementset"], 103);
+}
+#[test]
+fn exceptions_preserve_hresult_description_and_argument_name() {
+    let _apartment = Apartment::initialize().unwrap();
+    let (mut s, h, _) = setup("UnityProServer.ISections", 2);
+    let op = s
+        .catalog
+        .operation("UnityProServer.ISections.Add:method")
+        .unwrap()
+        .clone();
+    let error = s
+        .call(
+            &h,
+            &op,
+            &BTreeMap::from([
+                ("SectionName".into(), json!("Test")),
+                ("Language".into(), json!(0)),
+            ]),
+        )
+        .unwrap_err();
+    assert_eq!(error.hresult.as_deref(), Some("0x80020009"));
+    assert_eq!(error.details.unwrap()["argument"], "Language");
+    assert!(error.message.contains("Fixture rejected"));
+}
+#[test]
+fn property_put_supplies_the_named_dispatch_argument() {
+    let _apartment = Apartment::initialize().unwrap();
+    let (mut s, h, calls) = setup("UnityProServer.IVariable", 3);
+    let op = s
+        .catalog
+        .operation("UnityProServer.IVariable.Name:put")
+        .unwrap()
+        .clone();
+    s.call(
+        &h,
+        &op,
+        &BTreeMap::from([("arg0".into(), json!("NewName"))]),
+    )
+    .unwrap();
+    assert_eq!(calls.lock().unwrap()[0].1, DISPATCH_PROPERTYPUT.0);
+}
+#[test]
+fn codecs_roundtrip_arrays_bytes_and_byrefs_without_losing_types() {
+    let _apartment = Apartment::initialize().unwrap();
+    let mut s = State::new(Arc::new(
+        Catalog::load(crate::versions::Profile::select("15.1").unwrap()).unwrap(),
+    ));
+    let mixed = json!([1, true, "español", null, [2, 3]]);
+    let v = s.explicit_variant("array", &mixed).unwrap();
+    assert_eq!(s.output(&v, None, 0).unwrap(), mixed);
+    let bytes = json!([0, 127, 255]);
+    let v = s.explicit_variant("bytes", &bytes).unwrap();
+    assert_eq!(s.output(&v, None, 0).unwrap(), bytes);
+    assert!(s.explicit_variant("bytes", &json!([256])).is_err());
+    let mut slot = Box::new(VARIANT::from("before"));
+    let reference = by_ref(&mut slot, &variant_type()).unwrap();
+    unsafe {
+        let target = reference.Anonymous.Anonymous.Anonymous.pvarVal;
+        *target = VARIANT::from("after");
+    }
+    assert_eq!(s.output(&reference, None, 0).unwrap(), "after");
+}
+#[test]
+fn numeric_ranges_unknown_handles_and_release_are_enforced() {
+    let _apartment = Apartment::initialize().unwrap();
+    let (mut s, h, _) = setup("UnityProServer.IProject", 0);
+    assert!(
+        s.input(
+            &json!(-1),
+            &Type {
+                kind: "VT_UI4".into(),
+                ..variant_type()
+            }
+        )
+        .is_err()
+    );
+    assert!(
+        s.input(
+            &json!(2147483648i64),
+            &Type {
+                kind: "VT_I4".into(),
+                ..variant_type()
+            }
+        )
+        .is_err()
+    );
+    assert!(
+        s.input(&json!({"$object":"invalid"}), &variant_type())
+            .is_err()
+    );
+    s.run(
+        Action::Release { handle: h.clone() },
+        &Trace::new(1, "test", None),
+    )
+    .unwrap();
+    assert!(s.object(&h).is_err());
+}
+
+#[test]
+fn unserializable_results_release_new_handles_and_report_completed_operation() {
+    let _apartment = Apartment::initialize().unwrap();
+    let (mut s, h, _) = setup("UnityProServer.IOutputWindow", 4);
+    let op = s
+        .catalog
+        .operation("UnityProServer.IOutputWindow.GetContentsAsString:method")
+        .unwrap()
+        .clone();
+    let result = s
+        .call(&h, &op, &BTreeMap::from([("Tab".into(), json!("Build"))]))
+        .unwrap_err();
+    assert_eq!(result.code, "unsupported_operation");
+    assert_eq!(result.details.unwrap()["com_operation_completed"], true);
+    assert_eq!(s.objects.len(), 1); // Only the original fixture remains.
+}
+
+#[test]
+fn optional_interface_zero_defaults_are_null_references() {
+    let _apartment = Apartment::initialize().unwrap();
+    let (mut s, h, calls) = setup("UnityProServer.IApplication", 0);
+    let op = s
+        .catalog
+        .operation("UnityProServer.IApplication.SetPlcConnectionAddress:method")
+        .unwrap()
+        .clone();
+    s.call(
+        &h,
+        &op,
+        &BTreeMap::from([("NewConnectionAddress".into(), json!("127.0.0.1"))]),
+    )
+    .unwrap();
+    assert_eq!(
+        calls.lock().unwrap()[0].2,
+        vec![Value::Null, json!("127.0.0.1")]
+    );
+}
+
+#[test]
+fn reset_and_drop_release_real_com_references_newest_first() {
+    let _apartment = Apartment::initialize().unwrap();
+    let drops = Arc::new(Mutex::new(Vec::new()));
+    let mut state = State::new(Arc::new(
+        Catalog::load(crate::versions::Profile::select("15.1").unwrap()).unwrap(),
+    ));
+    for id in 1..=6 {
+        let fixture: IDispatch = Fixture {
+            mode: 0,
+            calls: Arc::new(Mutex::new(Vec::new())),
+            on_drop: Some((id, drops.clone())),
+        }
+        .into();
+        state.store(fixture.cast().unwrap(), None).unwrap();
+        drop(fixture);
+        if id == 3 {
+            let result = state
+                .run(Action::Reset, &Trace::new(1, "reset", None))
+                .unwrap();
+            assert_eq!(result["released_objects"], 3);
+        }
+    }
+    drop(state);
+    let drops = drops.lock().unwrap();
+    assert_eq!(
+        drops.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+        vec![3, 2, 1, 6, 5, 4]
+    );
+    assert!(
+        drops
+            .iter()
+            .all(|(_, thread)| *thread == std::thread::current().id())
+    );
+}

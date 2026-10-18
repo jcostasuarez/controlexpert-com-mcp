@@ -1,0 +1,22 @@
+{
+  "mcpServers": {
+    "control-expert": {
+      "type": "stdio",
+      "command": "C:/path/to/controlexpert-com-mcp/target/release/controlexpert-com-mcp.exe",
+      "args": ["--ce-version", "15.1"],
+      "env": {
+        "CommonProgramFiles": "C:/Program Files/Common Files",
+        "CommonProgramFiles(x86)": "C:/Program Files (x86)/Common Files",
+        "CommonProgramW6432": "C:/Program Files/Common Files",
+        "ProgramFiles": "C:/Program Files",
+        "ProgramFiles(x86)": "C:/Program Files (x86)",
+        "ProgramW6432": "C:/Program Files",
+        "CE_MCP_ALLOW_BUILD": "0",
+        "CE_MCP_ALLOW_PLC_CONNECTION": "0",
+        "CE_MCP_ALLOW_PLC_WRITE": "0",
+        "CE_MCP_ALLOW_SECURITY_ADMIN": "0",
+        "CE_MCP_ALLOW_PRIVATE_APIS": "0"
+      }
+    }
+  }
+}
