@@ -111,8 +111,8 @@ impl Catalog {
                 kind: text(f, "kind")?,
                 dispid: f["com"]["dispid"]
                     .as_i64()
-                    .ok_or_else(|| Error::new("invalid_catalog", "Invalid DISPID"))?
-                    as i32,
+                    .and_then(|d| i32::try_from(d).ok())
+                    .ok_or_else(|| Error::new("invalid_catalog", "Invalid DISPID"))?,
                 invoke_kind: text(&f["com"], "invoke_kind")?,
                 parameters: serde_json::from_value(f["io"]["parameters"].clone())
                     .map_err(|e| Error::new("invalid_catalog", e.to_string()))?,

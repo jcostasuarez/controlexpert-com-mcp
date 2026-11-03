@@ -1,0 +1,13 @@
+# Clippy thresholds from BeautifulRust (lints/clippy.toml).
+
+# Flag any function with a bool parameter: a bool argument is unreadable at the
+# call site and cannot grow a third mode. Use a two-variant enum instead.
+max-fn-params-bools = 0
+
+# unwrap, expect and printing are fine in tests, where a panic is the assertion.
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+allow-print-in-tests = true
+
+# Product names that doc_markdown would otherwise ask to wrap in backticks.
+doc-valid-idents = ["EcoStruxure", ".."]

@@ -128,9 +128,17 @@ fn verification_ignores_regenerated_identity_but_not_edits() {
     }
 }
 #[test]
+fn differences_name_each_changed_screen_once() {
+    let second = SCREEN.replace("name=\"Pantalla\"", "name=\"Segunda\"");
+    let original = Xfm::parse(&module_xfm(&format!("{SCREEN}{second}"))).unwrap();
+    let both_edited = format!("{SCREEN}{second}").replace("|Dynamic|", "|Dinamico|");
+    let edited = Xfm::parse(&module_xfm(&both_edited)).unwrap();
+    assert_eq!(differences(&original, &edited), ["Pantalla", "Segunda"]);
+}
+#[test]
 fn summary_counts_objects_and_aggregates_variables() {
     let xfm = Xfm::parse(&module_xfm(SCREEN)).unwrap();
-    let s = summary(&xfm, false);
+    let s = summary(&xfm, Detail::Counts);
     let screen = &s["screens"][0];
     assert_eq!(screen["object_count"], 4);
     assert_eq!(screen["objects_by_type"]["15"], 2);
@@ -142,7 +150,7 @@ fn summary_counts_objects_and_aggregates_variables() {
         ])
     );
     assert!(screen.get("objects").is_none());
-    let detailed = summary(&xfm, true);
+    let detailed = summary(&xfm, Detail::Objects);
     assert_eq!(
         detailed["screens"][0]["objects"][3]["variables"][1]["role"],
         "varPilot"
@@ -150,15 +158,21 @@ fn summary_counts_objects_and_aggregates_variables() {
 }
 #[test]
 fn paths_must_be_absolute_xfm_files() {
-    assert!(xfm_path("relative.XFM", false).is_err());
+    assert!(xfm_path("relative.XFM", Target::New).is_err());
     let dir = std::env::temp_dir();
-    assert!(xfm_path(&dir.join("x.xef").to_string_lossy(), false).is_err());
-    assert!(xfm_path(&dir.join("x.xfm").to_string_lossy(), false).is_ok());
-    assert!(xfm_path(&dir.join("missing-ce-mcp.XFM").to_string_lossy(), true).is_err());
+    assert!(xfm_path(&dir.join("x.xef").to_string_lossy(), Target::New).is_err());
+    assert!(xfm_path(&dir.join("x.xfm").to_string_lossy(), Target::New).is_ok());
+    assert!(
+        xfm_path(
+            &dir.join("missing-ce-mcp.XFM").to_string_lossy(),
+            Target::Existing
+        )
+        .is_err()
+    );
     assert!(
         xfm_path(
             &dir.join("no-such-dir").join("x.XFM").to_string_lossy(),
-            false
+            Target::New
         )
         .is_err()
     );

@@ -12,7 +12,7 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -32,8 +32,13 @@ const SAVE: &str = "UnityProServer.IProject.Save:method";
 /// import; they are not part of what the caller edits.
 const VOLATILE: [&str; 4] = ["FMId", "location", "creationDate", "modificationDate"];
 
+/// Arguments of `ce_screens_export`.
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
+#[expect(
+    clippy::doc_markdown,
+    reason = "field docs become the MCP tool schema shown to agents"
+)]
 pub struct ScreensExport {
     /// application.$object returned by ce_session_start.
     pub handle: String,
@@ -47,8 +52,13 @@ pub struct ScreensExport {
     #[serde(default)]
     pub include_objects: bool,
 }
+/// Arguments of `ce_screens_import`.
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
+#[expect(
+    clippy::doc_markdown,
+    reason = "field docs become the MCP tool schema shown to agents"
+)]
 pub struct ScreensImport {
     /// application.$object returned by ce_session_start.
     pub handle: String,
@@ -108,14 +118,23 @@ impl Screen {
 pub struct Xfm {
     pub modules: Vec<Module>,
     pub screens: Vec<Screen>,
-    /// (name, FMId) of each family.
+    /// (name, `FMId`) of each family.
     pub families: Vec<(String, Option<String>)>,
     pub messages: Vec<BTreeMap<String, String>>,
     /// Paths of elements that are not operator screens or module descriptions.
     pub foreign: Vec<String>,
 }
 
-fn attrs(node: roxmltree::Node) -> BTreeMap<String, String> {
+/// How much of each screen [`summary`] reports.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Detail {
+    /// Object counts and the variables each screen links.
+    Counts,
+    /// Also every object with its raw description and variables.
+    Objects,
+}
+
+fn attrs(node: roxmltree::Node<'_, '_>) -> BTreeMap<String, String> {
     node.attributes()
         .map(|a| (a.name().to_owned(), a.value().to_owned()))
         .collect()
@@ -123,7 +142,7 @@ fn attrs(node: roxmltree::Node) -> BTreeMap<String, String> {
 fn elements<'a, 'i>(
     node: roxmltree::Node<'a, 'i>,
 ) -> impl Iterator<Item = roxmltree::Node<'a, 'i>> {
-    node.children().filter(|c| c.is_element())
+    node.children().filter(roxmltree::Node::is_element)
 }
 impl Xfm {
     pub fn parse(text: &str) -> Result<Self> {
@@ -160,7 +179,7 @@ impl Xfm {
         })?;
         Self::parse(&text)
     }
-    fn logic_conf(&mut self, node: roxmltree::Node) {
+    fn logic_conf(&mut self, node: roxmltree::Node<'_, '_>) {
         for resource in elements(node) {
             if resource.tag_name().name() != "resource" {
                 self.foreign
@@ -173,7 +192,7 @@ impl Xfm {
         }
     }
     /// Collection exports wrap modules in FMId="ROOT"; module exports do not.
-    fn fm_desc(&mut self, node: roxmltree::Node, parent: Option<&str>, path: &str) {
+    fn fm_desc(&mut self, node: roxmltree::Node<'_, '_>, parent: Option<&str>, path: &str) {
         if node.tag_name().name() != "FMDesc" {
             self.foreign
                 .push(format!("{path}/{}", node.tag_name().name()));
@@ -196,7 +215,7 @@ impl Xfm {
             self.fm_desc(child, parent, &path);
         }
     }
-    fn io_screen(&mut self, node: roxmltree::Node) -> Result<()> {
+    fn io_screen(&mut self, node: roxmltree::Node<'_, '_>) -> Result<()> {
         for child in elements(node) {
             match child.tag_name().name() {
                 "screen" => self.screens.push(screen(child, None)?),
@@ -223,7 +242,7 @@ impl Xfm {
         self.screens.iter().map(Screen::normalized).collect()
     }
 }
-fn screen(node: roxmltree::Node, family: Option<&str>) -> Result<Screen> {
+fn screen(node: roxmltree::Node<'_, '_>, family: Option<&str>) -> Result<Screen> {
     let mut s = Screen {
         family: family.map(str::to_owned),
         attrs: attrs(node),
@@ -300,7 +319,7 @@ pub fn check_screens_only<'a>(xfm: &'a Xfm, module: &str) -> Result<&'a Module> 
     Ok(target)
 }
 
-pub fn summary(xfm: &Xfm, include_objects: bool) -> Value {
+pub fn summary(xfm: &Xfm, detail: Detail) -> Value {
     let screens: Vec<_> = xfm
         .screens
         .iter()
@@ -319,7 +338,7 @@ pub fn summary(xfm: &Xfm, include_objects: bool) -> Value {
             let mut v = json!({"name":s.name(),"family":s.family,"attributes":s.attrs,"comment":s.comment,
                 "object_count":s.objects.len(),"objects_by_type":types,
                 "variables":variables.iter().map(|((name,t,role),uses)| json!({"name":name,"type":t,"role":role,"uses":uses})).collect::<Vec<_>>()});
-            if include_objects {
+            if detail == Detail::Objects {
                 v["objects"] = s.objects.iter().enumerate().map(|(i, o)| json!({"index":i,"object_id":o.object_id,"description":o.description,
                     "variables":o.links.iter().map(|l| json!({"role":l.role,"attributes":l.attrs})).collect::<Vec<_>>()})).collect();
             }
@@ -331,23 +350,39 @@ pub fn summary(xfm: &Xfm, include_objects: bool) -> Value {
         "messages":xfm.messages.len(),"foreign_content":xfm.foreign})
 }
 
-/// Names of the screens whose editable content differs.
+/// Names of the screens whose editable content differs, each once and sorted,
+/// followed by `<messages>` when the message tables differ.
 pub fn differences(expected: &Xfm, actual: &Xfm) -> Vec<String> {
     let (a, b) = (expected.normalized_screens(), actual.normalized_screens());
-    let mut names: Vec<String> = a
+    let changed: BTreeSet<&str> = a
         .iter()
         .filter(|s| !b.contains(s))
         .chain(b.iter().filter(|s| !a.contains(s)))
-        .map(|s| s.name().to_owned())
+        .map(Screen::name)
         .collect();
+    let mut names: Vec<String> = changed.into_iter().map(str::to_owned).collect();
     if expected.messages != actual.messages {
         names.push("<messages>".into());
     }
-    names.dedup();
     names
 }
 
-fn xfm_path(raw: &str, must_exist: bool) -> Result<PathBuf> {
+/// Whether [`xfm_path`] requires the file to exist already.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Target {
+    /// A file to read: it must exist.
+    Existing,
+    /// A file to write: its folder must exist.
+    New,
+}
+/// Whether [`Scope::module`] asks for a write-access project.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Access {
+    Read,
+    Write,
+}
+
+fn xfm_path(raw: &str, target: Target) -> Result<PathBuf> {
     let path = PathBuf::from(raw);
     if !path.is_absolute() {
         return Err(Error::invalid(format!("{raw} must be an absolute path")));
@@ -360,10 +395,10 @@ fn xfm_path(raw: &str, must_exist: bool) -> Result<PathBuf> {
             "{raw} must have the .XFM extension"
         )));
     }
-    if must_exist && !path.is_file() {
+    if target == Target::Existing && !path.is_file() {
         return Err(Error::invalid(format!("{raw} does not exist")));
     }
-    if !must_exist && !path.parent().is_some_and(Path::is_dir) {
+    if target == Target::New && !path.parent().is_some_and(Path::is_dir) {
         return Err(Error::invalid(format!(
             "The folder of {raw} does not exist"
         )));
@@ -399,6 +434,7 @@ fn path_arg(path: &Path) -> Value {
 
 /// Every handle obtained here is released at the end, success or not; the
 /// caller only keeps the application handle it passed in.
+#[derive(Debug)]
 struct Scope<'a> {
     server: &'a Server,
     held: Vec<String>,
@@ -440,26 +476,24 @@ impl<'a> Scope<'a> {
         app: &str,
         project: Option<&str>,
         name: &str,
-        write: bool,
+        access: Access,
     ) -> Result<(String, String, String)> {
-        let project = match project {
-            Some(p) => p.to_owned(),
-            None => {
-                let token: &[(&str, Value)] = if write {
-                    &[("lWriteAccessToken", json!(1))]
-                } else {
-                    &[]
-                };
-                self.object(app, PROJECT, token).await.map_err(|mut e| {
-                    if write {
-                        e.message = format!(
-                            "{} If this client already holds a write-access IProject, pass it as project.",
-                            e.message
-                        );
-                    }
-                    e
-                })?
-            }
+        let project = if let Some(p) = project {
+            p.to_owned()
+        } else {
+            let token: &[(&str, Value)] = match access {
+                Access::Write => &[("lWriteAccessToken", json!(1))],
+                Access::Read => &[],
+            };
+            self.object(app, PROJECT, token).await.map_err(|mut e| {
+                if access == Access::Write {
+                    e.message = format!(
+                        "{} If this client already holds a write-access IProject, pass it as project.",
+                        e.message
+                    );
+                }
+                e
+            })?
         };
         let modules = self.object(&project, FCT_MODULES, &[]).await?;
         let module = self.item(&modules, name).await?;
@@ -491,11 +525,11 @@ fn is_empty_list(v: &Value) -> bool {
 }
 
 pub(crate) async fn export(server: &Server, p: ScreensExport) -> Result<Value> {
-    let path = xfm_path(&p.file_path, false)?;
+    let path = xfm_path(&p.file_path, Target::New)?;
     let mut scope = Scope::new(server);
     let exported = async {
         let (_, _, module) = scope
-            .module(&p.handle, p.project.as_deref(), &p.module, false)
+            .module(&p.handle, p.project.as_deref(), &p.module, Access::Read)
             .await?;
         scope
             .call(&module, EXPORT, &[("FileNameToExport", path_arg(&path))])
@@ -506,7 +540,12 @@ pub(crate) async fn export(server: &Server, p: ScreensExport) -> Result<Value> {
     exported?;
     let xfm = Xfm::read(&path)?;
     let importable = check_screens_only(&xfm, &p.module).err();
-    let mut out = summary(&xfm, p.include_objects);
+    let detail = if p.include_objects {
+        Detail::Objects
+    } else {
+        Detail::Counts
+    };
+    let mut out = summary(&xfm, detail);
     out["file_path"] = path_arg(&path);
     out["module"] = json!(p.module);
     out["importable"] = json!(importable.is_none());
@@ -518,11 +557,11 @@ pub(crate) async fn export(server: &Server, p: ScreensExport) -> Result<Value> {
 }
 
 pub(crate) async fn import(server: &Server, p: ScreensImport) -> Result<Value> {
-    let path = xfm_path(&p.file_path, true)?;
+    let path = xfm_path(&p.file_path, Target::Existing)?;
     let incoming = Xfm::read(&path)?;
     check_screens_only(&incoming, &p.module)?;
     let backup = match &p.backup_path {
-        Some(b) => xfm_path(b, false)?,
+        Some(b) => xfm_path(b, Target::New)?,
         None => default_backup(&p.module)?,
     };
     if backup == path {
@@ -541,7 +580,7 @@ async fn replace(
     backup: &Path,
 ) -> Result<Value> {
     let (project, modules, module) = scope
-        .module(&p.handle, p.project.as_deref(), &p.module, true)
+        .module(&p.handle, p.project.as_deref(), &p.module, Access::Write)
         .await?;
     scope
         .call(&module, EXPORT, &[("FileNameToExport", path_arg(backup))])

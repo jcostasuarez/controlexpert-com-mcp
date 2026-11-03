@@ -3,7 +3,8 @@ use serde_json::json;
 use std::collections::BTreeMap;
 
 fn catalog() -> Catalog {
-    Catalog::load(Profile::select("15.1").unwrap()).unwrap()
+    Catalog::load(Profile::select("15.1").expect("15.1 is supported"))
+        .expect("the bundled catalog loads")
 }
 #[test]
 fn catalog_is_complete_and_interfaces_exist() {

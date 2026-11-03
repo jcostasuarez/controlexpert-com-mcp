@@ -1,3 +1,5 @@
+//! Structured diagnostics: one JSON object per line on stderr, never argument
+//! values. stdout belongs to the MCP transport.
 use crate::error::Result;
 use serde_json::{Value, json};
 use std::{
@@ -9,13 +11,19 @@ use std::{
 pub(super) fn emit(event: &str, fields: Value) {
     // A disconnected client's stderr must not panic the COM worker during
     // reference cleanup.
-    let _ = writeln!(
-        std::io::stderr().lock(),
-        "{}",
-        json!({"event":event,"timestamp_ms":SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis(),"details":fields})
-    );
+    let mut line = json!({
+        "event": event,
+        "timestamp_ms": SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis(),
+    });
+    line["details"] = fields;
+    let _ = writeln!(std::io::stderr().lock(), "{line}");
 }
 
+/// Progress of one queued operation, shared between the caller and the STA.
+#[derive(Debug)]
 pub(crate) struct Trace {
     id: u64,
     action: &'static str,
@@ -35,7 +43,7 @@ impl Trace {
         }
     }
     pub(super) fn snapshot(&self) -> Value {
-        let (phase, started) = *self.phase.lock().unwrap();
+        let (phase, started) = *self.phase.lock().expect("trace lock poisoned");
         json!({"operation_id":self.id,"action":self.action,"api_id":self.api_id,"phase":phase,"elapsed_ms":self.queued_at.elapsed().as_millis(),"phase_elapsed_ms":started.elapsed().as_millis()})
     }
     pub(super) fn event(&self, event: &str) {
@@ -55,7 +63,7 @@ impl Trace {
         phase: &'static str,
         run: impl FnOnce() -> Result<T>,
     ) -> Result<T> {
-        *self.phase.lock().unwrap() = (phase, Instant::now());
+        *self.phase.lock().expect("trace lock poisoned") = (phase, Instant::now());
         self.event("phase_started");
         let started = Instant::now();
         let result = run();

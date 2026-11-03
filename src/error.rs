@@ -1,5 +1,9 @@
+//! The single error type returned by every tool. It serializes as the
+//! `{"error": ...}` payload that MCP clients receive.
 use serde::Serialize;
 
+/// A tool failure with a stable machine-readable `code`, a human-readable
+/// `message`, and optional COM evidence.
 #[derive(Debug, Clone, Serialize, thiserror::Error)]
 #[error("{message}")]
 pub struct Error {
@@ -74,7 +78,7 @@ impl From<windows::core::Error> for Error {
         Self {
             code: "com_error".into(),
             message: e.message(),
-            hresult: Some(format!("0x{:08X}", e.code().0 as u32)),
+            hresult: Some(format!("0x{:08X}", e.code().0.cast_unsigned())),
             details: None,
         }
     }
