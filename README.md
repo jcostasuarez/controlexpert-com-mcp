@@ -318,6 +318,23 @@ The smoke test drives the real binary over stdio: MCP initialization, discovery,
 
 References: [RMCP 3.5.1](https://github.com/modelcontextprotocol/rust-sdk/releases/tag/rmcp-v3.5.1), [official Rust SDK](https://github.com/modelcontextprotocol/rust-sdk), [Unity Developer's Edition](https://www.se.com/sg/en/product-range/630-unity-developers-edition/).
 
+## Code quality
+
+The lint policy lives in `Cargo.toml` (`[lints]`) and `clippy.toml`. It is adapted from [BeautifulRust](https://github.com/morganlinton/BeautifulRust), which distills the Rust API Guidelines, *Effective Rust* and other style guides, with the library-only lints left out because this crate is an application. In short:
+
+- every `unsafe` block holds one operation and a `// SAFETY:` comment that says why it is sound; `VARIANT` union access goes through two helpers in `src/runtime/windows.rs`;
+- no `unwrap()` outside tests, no silent `as` casts, no `bool` parameters, no wildcard imports;
+- a lint is silenced only with `#[expect(..., reason = "...")]` on the narrowest item, so stale suppressions are reported.
+
+CI (`.github/workflows/ci.yml`) runs on every push to `main` and every pull request: `rustfmt`, `clippy -D warnings` for both Linux and the Windows COM backend (cross-checked with the `x86_64-pc-windows-gnu` target), the test suite on Linux and on Windows, and a build with the minimum supported Rust version from `rust-version`. On Windows the suite includes the COM marshalling and policy tests; they use local `IDispatch` fixtures and need no Control Expert installation.
+
+To check the Windows code from Linux or macOS:
+
+```bash
+rustup target add x86_64-pc-windows-gnu
+cargo clippy --locked --all-targets --target x86_64-pc-windows-gnu -- -D warnings
+```
+
 ## License
 
 MIT.
