@@ -91,7 +91,7 @@ fn fixture() -> (
     mpsc::Sender<()>,
 ) {
     let observed = Arc::new(Observed::default());
-    let worker_observed = observed.clone();
+    let worker_observed = Arc::clone(&observed);
     let (started_tx, started_rx) = oneshot::channel();
     let (gate_tx, gate_rx) = mpsc::channel();
     let runtime = Runtime::start_worker(

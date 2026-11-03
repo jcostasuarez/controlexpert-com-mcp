@@ -1,3 +1,6 @@
+//! The COM runtime: one single-threaded apartment (STA) worker thread that owns
+//! every COM object, fed through a bounded queue.
+//!
 //! Only plain Rust/JSON values cross this boundary. COM objects stay on the STA.
 use crate::{
     catalog::{Catalog, Operation},
@@ -9,7 +12,7 @@ use serde_json::{Value, json};
 use std::{
     collections::BTreeMap,
     sync::{
-        Arc, Mutex,
+        Arc, Mutex, PoisonError,
         atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         mpsc,
     },
@@ -23,6 +26,8 @@ mod tests;
 #[cfg(windows)]
 mod windows;
 
+/// A unit of work for the STA worker.
+#[derive(Debug)]
 pub enum Action {
     Probe,
     SessionStart {
@@ -75,7 +80,9 @@ struct Delivery {
 impl Delivery {
     fn accept(mut self) -> Result<Value> {
         self.handles.clear();
-        self.result.take().unwrap()
+        self.result
+            .take()
+            .expect("a delivery holds its result until it is accepted once")
     }
 }
 impl Drop for Delivery {
@@ -115,13 +122,26 @@ impl Drop for Inner {
         // Fallback for library callers. The executable awaits shutdown() too,
         // keeping the process alive until the STA has released COM references.
         self.status.closing.store(true, Ordering::SeqCst);
-        self.tx.get_mut().unwrap().take();
+        // A destructor must not panic: recover the sender even if poisoned.
+        self.tx
+            .get_mut()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
     }
 }
+/// Cheap-to-clone handle to the STA worker.
 #[derive(Clone)]
 pub struct Runtime {
     inner: Arc<Inner>,
     policy: ExecutionPolicy,
+}
+impl std::fmt::Debug for Runtime {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Runtime")
+            .field("policy", &self.policy)
+            .field("slow_call_after", &self.inner.slow_call_after)
+            .finish_non_exhaustive()
+    }
 }
 
 /// Created and dropped on the worker. The backend need not be Send.
@@ -206,7 +226,7 @@ impl Runtime {
         }
         #[cfg(not(windows))]
         {
-            let _ = catalog;
+            drop(catalog);
             let mut runtime = Self::start_worker(|| Ok(UnsupportedBackend), slow_call_after)?;
             runtime.policy = policy;
             Ok(runtime)
@@ -223,10 +243,12 @@ impl Runtime {
         let (cleanup_tx, cleanup_rx) = mpsc::channel();
         let status = Arc::new(Status::default());
         status.worker_running.store(true, Ordering::SeqCst);
-        let worker_status = status.clone();
+        let worker_status = Arc::clone(&status);
         let worker = std::thread::Builder::new()
             .name("control-expert-sta".into())
-            .spawn(move || worker_loop(factory, rx, cleanup_tx, cleanup_rx, worker_status))
+            .spawn(move || {
+                worker_loop(factory, &rx, &cleanup_tx, &cleanup_rx, &worker_status);
+            })
             .map_err(|e| Error::new("runtime_start_failed", e.to_string()))?;
         Ok(Self {
             policy: ExecutionPolicy::default(),
@@ -244,7 +266,7 @@ impl Runtime {
         })
     }
     fn submit(&self, action: Action) -> Result<(oneshot::Receiver<Delivery>, Arc<Trace>)> {
-        let sender = self.inner.tx.lock().unwrap();
+        let sender = self.inner.tx.lock().expect("runtime sender lock poisoned");
         let sender = sender.as_ref().ok_or_else(closing_error)?;
         let api_id = match &action {
             Action::Call { operation, .. } => Some(operation.id.clone()),
@@ -259,7 +281,7 @@ impl Runtime {
         self.inner.status.queued.fetch_add(1, Ordering::SeqCst);
         if let Err(error) = sender.try_send(Request {
             action,
-            trace: trace.clone(),
+            trace: Arc::clone(&trace),
             reply,
         }) {
             self.inner.status.queued.fetch_sub(1, Ordering::SeqCst);
@@ -275,7 +297,7 @@ impl Runtime {
         loop {
             tokio::select! {
                 result = &mut rx => return result.map_err(|_| Error::new("runtime_unavailable", "The COM thread ended before answering"))?.accept(),
-                _ = tokio::time::sleep(self.inner.slow_call_after) => trace.event("operation_waiting"),
+                () = tokio::time::sleep(self.inner.slow_call_after) => trace.event("operation_waiting"),
             }
         }
     }
@@ -289,13 +311,27 @@ impl Runtime {
     pub fn status(&self) -> Value {
         let status = &self.inner.status;
         let running = status.worker_running.load(Ordering::SeqCst);
-        json!({"accepting_requests":!status.closing.load(Ordering::SeqCst) && running,"worker_running":running,"application_ready":running && status.application_ready.load(Ordering::SeqCst),"queued_operations":if running {status.queued.load(Ordering::SeqCst)} else {0},"active_operation":status.active.lock().unwrap().as_ref().map(|t| t.snapshot()),"slow_call_after_ms":self.inner.slow_call_after.as_millis(),"note":"application_ready means a validated and retained IApplication reference, not a continuous liveness check. A COM operation that started cannot be interrupted or retried automatically."})
+        let active = status
+            .active
+            .lock()
+            .expect("active operation lock poisoned")
+            .as_ref()
+            .map(|t| t.snapshot());
+        json!({
+            "accepting_requests": !status.closing.load(Ordering::SeqCst) && running,
+            "worker_running": running,
+            "application_ready": running && status.application_ready.load(Ordering::SeqCst),
+            "queued_operations": if running { status.queued.load(Ordering::SeqCst) } else { 0 },
+            "active_operation": active,
+            "slow_call_after_ms": self.inner.slow_call_after.as_millis(),
+            "note": "application_ready means a validated and retained IApplication reference, not a continuous liveness check. A COM operation that started cannot be interrupted or retried automatically."
+        })
     }
     /// Reject new work, skip queued requests, finish the active call, release
     /// references on the STA and join it before permitting process exit.
     pub async fn shutdown(&self) -> Result<()> {
         {
-            let mut sender = self.inner.tx.lock().unwrap();
+            let mut sender = self.inner.tx.lock().expect("runtime sender lock poisoned");
             self.inner.status.closing.store(true, Ordering::SeqCst);
             sender.take();
         }
@@ -311,9 +347,13 @@ impl Runtime {
         // Await by reference: cancellation of this future leaves the join
         // task owned by Runtime, so another caller can still wait for it.
         let joined = loop {
+            let joining = worker
+                .joining
+                .as_mut()
+                .expect("the join task exists until an outcome is recorded");
             tokio::select! {
-                joined = worker.joining.as_mut().unwrap() => break joined,
-                _ = tokio::time::sleep(self.inner.slow_call_after) => emit("runtime_shutdown_waiting", self.status()),
+                joined = joining => break joined,
+                () = tokio::time::sleep(self.inner.slow_call_after) => emit("runtime_shutdown_waiting", self.status()),
             }
         };
         let outcome = match joined {
@@ -337,57 +377,61 @@ fn closing_error() -> Error {
     )
 }
 
+/// Releases handles whose delivery was dropped, then refreshes the gate.
+fn release_orphans<B: Backend>(
+    state: &mut B,
+    cleanup_rx: &mpsc::Receiver<Vec<String>>,
+    status: &Status,
+) {
+    for handles in cleanup_rx.try_iter() {
+        let released = state.release_handles(&handles);
+        emit(
+            "orphaned_references_released",
+            json!({"released_objects":released}),
+        );
+    }
+    status
+        .application_ready
+        .store(state.application_ready(), Ordering::SeqCst);
+}
+
 fn worker_loop<B: Backend>(
     factory: impl FnOnce() -> Result<B>,
-    rx: mpsc::Receiver<Request>,
-    cleanup_tx: mpsc::Sender<Vec<String>>,
-    cleanup_rx: mpsc::Receiver<Vec<String>>,
-    status: Arc<Status>,
+    rx: &mpsc::Receiver<Request>,
+    cleanup_tx: &mpsc::Sender<Vec<String>>,
+    cleanup_rx: &mpsc::Receiver<Vec<String>>,
+    status: &Arc<Status>,
 ) {
     struct WorkerExit(Arc<Status>);
     impl Drop for WorkerExit {
         fn drop(&mut self) {
             self.0.worker_running.store(false, Ordering::SeqCst);
             self.0.application_ready.store(false, Ordering::SeqCst);
-            *self.0.active.lock().unwrap() = None;
+            // A destructor must not panic: clear the slot even if poisoned.
+            *self.0.active.lock().unwrap_or_else(PoisonError::into_inner) = None;
         }
     }
-    let _exit = WorkerExit(status.clone());
+    let _exit = WorkerExit(Arc::clone(status));
     let mut backend = factory();
     loop {
         if let Ok(state) = &mut backend {
-            for handles in cleanup_rx.try_iter() {
-                let released = state.release_handles(&handles);
-                emit(
-                    "orphaned_references_released",
-                    json!({"released_objects":released}),
-                );
-            }
-            status
-                .application_ready
-                .store(state.application_ready(), Ordering::SeqCst);
+            release_orphans(state, cleanup_rx, status);
         }
         match rx.recv_timeout(Duration::from_millis(15)) {
             Ok(request) => {
                 status.queued.fetch_sub(1, Ordering::SeqCst);
                 // A delivery may have been dropped while recv_timeout waited.
                 if let Ok(state) = &mut backend {
-                    for handles in cleanup_rx.try_iter() {
-                        let released = state.release_handles(&handles);
-                        emit(
-                            "orphaned_references_released",
-                            json!({"released_objects":released}),
-                        );
-                    }
-                    status
-                        .application_ready
-                        .store(state.application_ready(), Ordering::SeqCst);
+                    release_orphans(state, cleanup_rx, status);
                 }
                 if request.reply.is_closed() {
                     request.trace.event("operation_cancelled_before_execution");
                     continue;
                 }
-                *status.active.lock().unwrap() = Some(request.trace.clone());
+                *status
+                    .active
+                    .lock()
+                    .expect("active operation lock poisoned") = Some(Arc::clone(&request.trace));
                 request.trace.event("operation_started");
                 let mut handles = Vec::new();
                 let result = if status.closing.load(Ordering::SeqCst) {
@@ -422,7 +466,10 @@ fn worker_loop<B: Backend>(
                     handles,
                     cleanup: cleanup_tx.clone(),
                 });
-                *status.active.lock().unwrap() = None;
+                *status
+                    .active
+                    .lock()
+                    .expect("active operation lock poisoned") = None;
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
@@ -433,8 +480,7 @@ fn worker_loop<B: Backend>(
     }
     let remaining = backend
         .as_ref()
-        .map(|state| state.handles_since(0).len())
-        .unwrap_or(0);
+        .map_or(0, |state| state.handles_since(0).len());
     drop(backend); // Objects and then the COM apartment.
     emit(
         "com_worker_stopped",

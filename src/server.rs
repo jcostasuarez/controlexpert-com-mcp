@@ -1,3 +1,4 @@
+//! The MCP tool surface: argument schemas and one handler per tool.
 use crate::{
     catalog::Catalog,
     error::{Error, Result as CeResult},
@@ -15,10 +16,14 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
+/// Name reported to MCP clients and printed by `--version`.
 pub const SERVER_NAME: &str = "controlexpert-com-mcp";
+/// MCP SDK reported to clients; keep in sync with the `rmcp` pin in Cargo.toml.
+pub const SDK: &str = "RMCP 3.5.1";
 const DISCLAIMER: &str = "Unofficial project; not affiliated with, endorsed by or supported by Schneider Electric. EcoStruxure and Control Expert are trademarks of their respective owners.";
 
-#[derive(Clone)]
+/// The MCP server: the immutable catalog plus the COM runtime.
+#[derive(Clone, Debug)]
 pub struct Server {
     pub catalog: Arc<Catalog>,
     pub runtime: Runtime,
@@ -29,7 +34,7 @@ impl Server {
     }
     pub fn with_options(version: &str, slow_call_after: Duration) -> CeResult<Self> {
         let catalog = Arc::new(Catalog::load(Profile::select(version)?)?);
-        let runtime = Runtime::start_with_options(catalog.clone(), slow_call_after)?;
+        let runtime = Runtime::start_with_options(Arc::clone(&catalog), slow_call_after)?;
         Ok(Self { catalog, runtime })
     }
     pub(crate) async fn invoke(
@@ -85,6 +90,10 @@ pub struct Handle {
 }
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
+#[expect(
+    clippy::doc_markdown,
+    reason = "field docs become the MCP tool schema shown to agents"
+)]
 pub struct Call {
     /// Handle received as $object; only valid in the current session.
     pub handle: String,
@@ -180,7 +189,7 @@ impl Server {
             .filter(|o| self.catalog.invocation_reason(o).is_none())
             .count();
         result(Ok(
-            json!({"server":SERVER_NAME,"server_version":env!("CARGO_PKG_VERSION"),"sdk":"RMCP 3.5.1","disclaimer":DISCLAIMER,
+            json!({"server":SERVER_NAME,"server_version":env!("CARGO_PKG_VERSION"),"sdk":SDK,"disclaimer":DISCLAIMER,
             "lifecycle":{"atomic_session_start":true,"application_gate":true,"application_ready":self.runtime.status()["application_ready"],"orphan_reference_cleanup":true,"graceful_sta_shutdown":true,"status_tool":"ce_runtime_status","diagnostics":"JSON on stderr, without argument values","slow_call_after_ms":self.runtime.status()["slow_call_after_ms"]},
             "supported_versions":["15.1"],"selected_version":self.catalog.profile.version,"catalog":self.catalog.document["summary"],
             "execution_policy":self.runtime.execution_policy(),

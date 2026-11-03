@@ -12,6 +12,10 @@ pub const ENV_PRIVATE_APIS: &str = "CE_MCP_ALLOW_PRIVATE_APIS";
 
 /// Immutable for the lifetime of a server process; no MCP call changes it.
 #[derive(Clone, Copy, Debug, Default)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "each flag mirrors one independent CE_MCP_ALLOW_* switch"
+)]
 pub struct ExecutionPolicy {
     pub allow_build: bool,
     pub allow_plc_connection: bool,
@@ -129,7 +133,7 @@ impl ExecutionPolicy {
             _ => Ok(()),
         }
     }
-    /// Activation and QueryInterface follow the category rules of calls.
+    /// Activation and `QueryInterface` follow the category rules of calls.
     pub fn check_category(self, kind: &str, id: &str, category: &str) -> Result<()> {
         let (allowed, reason, setting) = match category_restriction(category) {
             Restriction::SecurityAdmin => (
@@ -237,6 +241,7 @@ fn category_restriction(category: &str) -> Restriction {
 pub fn is_ui_entry(op: &Operation) -> bool {
     op.name.starts_with("Display") || op.name == "SetDisplayPosition"
 }
+#[cfg(windows)]
 pub(crate) fn viewer_blocked(op: &Operation) -> Error {
     let mut error = Error::new(
         "operation_blocked",
@@ -266,10 +271,11 @@ mod tests {
 
     fn policy(values: &[(&str, &str)]) -> ExecutionPolicy {
         let values: HashMap<_, _> = values.iter().copied().collect();
-        ExecutionPolicy::from_lookup(|name| values.get(name).map(|v| v.to_string()))
+        ExecutionPolicy::from_lookup(|name| values.get(name).map(ToString::to_string))
     }
     fn catalog() -> Catalog {
-        Catalog::load(Profile::select("15.1").unwrap()).unwrap()
+        Catalog::load(Profile::select("15.1").expect("15.1 is supported"))
+            .expect("the bundled catalog loads")
     }
 
     #[test]

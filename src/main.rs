@@ -1,5 +1,6 @@
+//! Command-line entry point: parses arguments and serves MCP over stdio.
 use controlexpert_com_mcp::{
-    server::{SERVER_NAME, Server},
+    server::{SDK, SERVER_NAME, Server},
     versions::Profile,
 };
 use rmcp::{ServiceExt, transport::stdio};
@@ -15,7 +16,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "--ce-version" => version = args.next().ok_or("Missing value for --ce-version")?,
             "--version" => {
                 println!(
-                    "{SERVER_NAME} {} (RMCP 3.5.1; Control Expert 15.1)",
+                    "{SERVER_NAME} {} ({SDK}; Control Expert 15.1)",
                     env!("CARGO_PKG_VERSION")
                 );
                 return Ok(());
@@ -41,7 +42,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Profile::select(&version)?;
     let server = Server::with_options(&version, Duration::from_millis(slow_call_after_ms))?;
     let runtime = server.runtime.clone();
-    eprintln!("{SERVER_NAME}: Control Expert {version}, stdio transport, RMCP 3.5.1");
+    eprintln!("{SERVER_NAME}: Control Expert {version}, stdio transport, {SDK}");
     let serving: Result<(), Box<dyn std::error::Error>> = async {
         let service = server.serve(stdio()).await?;
         service.waiting().await?;

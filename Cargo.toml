@@ -21,3 +21,57 @@ windows = { version = "0.61.3", features = ["Win32_Foundation", "Win32_System_Co
 [target.'cfg(windows)'.dev-dependencies]
 windows-core = "0.61.2"
 
+
+# Lint policy adapted from BeautifulRust (https://github.com/morganlinton/BeautifulRust,
+# lints/lints.toml). This crate is an application: the library target only exists so
+# the binary and the integration tests share code, so the library-only lints
+# (missing_docs, missing_errors_doc, missing_panics_doc, exhaustive_enums,
+# print_stdout, print_stderr) are left out. CI runs clippy with -D warnings.
+[lints.rust]
+unsafe_op_in_unsafe_fn = "warn"
+missing_debug_implementations = "warn"
+unreachable_pub = "warn"
+rust_2018_idioms = { level = "warn", priority = -1 }
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+
+# Panics: return errors, and give every intentional panic a reason.
+unwrap_used = "warn"
+panic_in_result_fn = "warn"
+missing_assert_message = "warn"
+
+# Suppressions must explain themselves and expire when no longer needed.
+allow_attributes = "warn"
+allow_attributes_without_reason = "warn"
+
+# Unsafe must be justified.
+undocumented_unsafe_blocks = "warn"
+multiple_unsafe_ops_per_block = "warn"
+
+# API shape.
+fn_params_excessive_bools = "warn"
+struct_excessive_bools = "warn"
+clone_on_ref_ptr = "warn"
+redundant_clone = "warn"
+rc_buffer = "warn"
+
+# Idioms and leftovers.
+string_add = "warn"
+wildcard_imports = "warn"
+dbg_macro = "warn"
+todo = "warn"
+
+# Casts that silently lose information.
+as_conversions = "warn"
+cast_possible_truncation = "warn"
+cast_sign_loss = "warn"
+
+# Pedantic lints that are mostly noise here.
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
+module_inception = "allow"
+enum_glob_use = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
