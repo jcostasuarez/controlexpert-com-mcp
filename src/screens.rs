@@ -12,7 +12,7 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -331,19 +331,20 @@ pub fn summary(xfm: &Xfm, include_objects: bool) -> Value {
         "messages":xfm.messages.len(),"foreign_content":xfm.foreign})
 }
 
-/// Names of the screens whose editable content differs.
+/// Names of the screens whose editable content differs, each once and sorted,
+/// followed by `<messages>` when the message tables differ.
 pub fn differences(expected: &Xfm, actual: &Xfm) -> Vec<String> {
     let (a, b) = (expected.normalized_screens(), actual.normalized_screens());
-    let mut names: Vec<String> = a
+    let changed: BTreeSet<&str> = a
         .iter()
         .filter(|s| !b.contains(s))
         .chain(b.iter().filter(|s| !a.contains(s)))
-        .map(|s| s.name().to_owned())
+        .map(Screen::name)
         .collect();
+    let mut names: Vec<String> = changed.into_iter().map(str::to_owned).collect();
     if expected.messages != actual.messages {
         names.push("<messages>".into());
     }
-    names.dedup();
     names
 }
 

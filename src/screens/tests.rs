@@ -128,6 +128,14 @@ fn verification_ignores_regenerated_identity_but_not_edits() {
     }
 }
 #[test]
+fn differences_name_each_changed_screen_once() {
+    let second = SCREEN.replace("name=\"Pantalla\"", "name=\"Segunda\"");
+    let original = Xfm::parse(&module_xfm(&format!("{SCREEN}{second}"))).unwrap();
+    let both_edited = format!("{SCREEN}{second}").replace("|Dynamic|", "|Dinamico|");
+    let edited = Xfm::parse(&module_xfm(&both_edited)).unwrap();
+    assert_eq!(differences(&original, &edited), ["Pantalla", "Segunda"]);
+}
+#[test]
 fn summary_counts_objects_and_aggregates_variables() {
     let xfm = Xfm::parse(&module_xfm(SCREEN)).unwrap();
     let s = summary(&xfm, false);
