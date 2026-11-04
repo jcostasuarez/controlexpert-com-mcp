@@ -28,7 +28,8 @@ First public release. Earlier versions (0.1.x) were never published; the
   transfers without `CE_MCP_ALLOW_PLC_WRITE` are verified against the
   simulator immediately before the call.
 - A Windows release build (`x86_64-pc-windows-msvc`, static CRT) attached to
-  each GitHub release.
+  each GitHub release, published by running the Release workflow from the
+  Actions tab.
 
 ### Changed
 
