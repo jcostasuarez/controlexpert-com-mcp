@@ -336,14 +336,9 @@ CI (`.github/workflows/ci.yml`) runs on Windows on every push to `main` and ever
 
 1. Move the `[Unreleased]` entries of `CHANGELOG.md` into a new section `## [X.Y.Z] - YYYY-MM-DD` and set `version = "X.Y.Z"` in `Cargo.toml` (run `cargo check` so `Cargo.lock` follows).
 2. Merge to `main` with CI green.
-3. Tag that commit and push the tag:
+3. In GitHub, open **Actions → Release → Run workflow**, keep the branch on `main` and run it. Tick **dry_run** first to build the zip as a workflow artifact without publishing anything.
 
-   ```bash
-   git tag -a vX.Y.Z -m "vX.Y.Z"
-   git push origin vX.Y.Z
-   ```
-
-`.github/workflows/release.yml` then checks that the tag matches `Cargo.toml` and that the changelog has a section for it, runs the tests, builds the release executable and publishes the GitHub release with the zip, its SHA-256 and that changelog section as notes.
+`.github/workflows/release.yml` checks that `CHANGELOG.md` has a section for the version in `Cargo.toml` and that the tag `vX.Y.Z` does not exist yet, runs the tests, builds the release executable and publishes the GitHub release, which creates the tag on that commit. The release carries the zip, its SHA-256 and that changelog section as notes. Pushing a tag `vX.Y.Z` from a local clone runs the same workflow.
 
 ## License
 
