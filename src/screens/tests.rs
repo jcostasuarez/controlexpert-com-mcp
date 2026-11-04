@@ -42,7 +42,7 @@ fn parses_module_export_with_screens_objects_and_variables() {
             parent: None
         }]
     );
-    assert!(xfm.foreign.is_empty());
+    assert_eq!(xfm.foreign, Vec::<String>::new());
     let [screen] = xfm.screens.as_slice() else {
         panic!("one screen expected")
     };
@@ -115,7 +115,10 @@ fn verification_ignores_regenerated_identity_but_not_edits() {
             .replace("FMId=\"efK\"", "FMId=\"egK\"")
             .replace("15:24:35", "16:00:00"),
     );
-    assert!(differences(&original, &Xfm::parse(&reimported).unwrap()).is_empty());
+    assert_eq!(
+        differences(&original, &Xfm::parse(&reimported).unwrap()),
+        Vec::<String>::new()
+    );
 
     for edit in [
         SCREEN.replace("|Dynamic|", "|Dinamico|"),

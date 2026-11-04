@@ -6,6 +6,10 @@ An MCP server for the COM automation API (UDE, Unity Developer's Edition) of **E
 
 The executable embeds the catalog: 1,277 methods, property accessors and callbacks from 120 interfaces and 17 type libraries. The bridge can prepare **1,178 IDispatch contracts** in this version. The 54 callbacks, 41 members of interfaces without IDispatch and 4 contracts with unimplemented types can be inspected but not invoked. That count describes transport coverage. It does not mean that all 1,178 operations were tested against Control Expert, or that every interface is a supported public API.
 
+## Download
+
+Each [GitHub release](https://github.com/jcostasuarez/controlexpert-com-mcp/releases) has a zip with `controlexpert-com-mcp.exe` for 64-bit Windows, this README, the changelog and the example `mcp.json` and `codex-mcp.toml`, plus a `.sha256` file to check the download. Extract it anywhere and point the `command` of your MCP client entry at the extracted `controlexpert-com-mcp.exe`. The executable needs no Rust toolchain or Visual C++ runtime; COM calls still need Control Expert 15.1 installed and registered. Changes between versions are listed in [`CHANGELOG.md`](CHANGELOG.md).
+
 ## Build and run
 
 Requirements: Rust 1.90 or later, Windows, and Control Expert 15.1 for COM calls. The catalog and its queries work without Control Expert. Python is not needed to run the server.
@@ -326,14 +330,20 @@ The lint policy lives in `Cargo.toml` (`[lints]`) and `clippy.toml`. It is adapt
 - no `unwrap()` outside tests, no silent `as` casts, no `bool` parameters, no wildcard imports;
 - a lint is silenced only with `#[expect(..., reason = "...")]` on the narrowest item, so stale suppressions are reported.
 
-CI (`.github/workflows/ci.yml`) runs on every push to `main` and every pull request: `rustfmt`, `clippy -D warnings` for both Linux and the Windows COM backend (cross-checked with the `x86_64-pc-windows-gnu` target), the test suite on Linux and on Windows, and a build with the minimum supported Rust version from `rust-version`. On Windows the suite includes the COM marshalling and policy tests; they use local `IDispatch` fixtures and need no Control Expert installation.
+CI (`.github/workflows/ci.yml`) runs on Windows on every push to `main` and every pull request: `rustfmt`, `clippy -D warnings`, the test suite (including the COM marshalling and policy tests, which use local `IDispatch` fixtures and need no Control Expert installation) and a build with the minimum supported Rust version from `rust-version`. The Rust version for fmt, clippy and tests is pinned in the workflow (`RUST_TOOLCHAIN`) so a new Rust release cannot break CI with new lints; bump it deliberately, together with the fixes it asks for.
 
-To check the Windows code from Linux or macOS:
+## Releasing
 
-```bash
-rustup target add x86_64-pc-windows-gnu
-cargo clippy --locked --all-targets --target x86_64-pc-windows-gnu -- -D warnings
-```
+1. Move the `[Unreleased]` entries of `CHANGELOG.md` into a new section `## [X.Y.Z] - YYYY-MM-DD` and set `version = "X.Y.Z"` in `Cargo.toml` (run `cargo check` so `Cargo.lock` follows).
+2. Merge to `main` with CI green.
+3. Tag that commit and push the tag:
+
+   ```bash
+   git tag -a vX.Y.Z -m "vX.Y.Z"
+   git push origin vX.Y.Z
+   ```
+
+`.github/workflows/release.yml` then checks that the tag matches `Cargo.toml` and that the changelog has a section for it, runs the tests, builds the release executable and publishes the GitHub release with the zip, its SHA-256 and that changelog section as notes.
 
 ## License
 

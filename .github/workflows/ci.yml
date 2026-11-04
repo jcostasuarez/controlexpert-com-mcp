@@ -12,46 +12,33 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: -D warnings
+  # Pinned so a new Rust release cannot turn CI red with new lints.
+  # Bump it on purpose, together with the fixes it asks for. Keep it in
+  # sync with release.yml.
+  RUST_TOOLCHAIN: "1.99"
 
 jobs:
-  lint:
-    name: fmt and clippy (Linux and Windows code)
-    runs-on: ubuntu-latest
+  check:
+    name: fmt, clippy and test
+    runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
           components: rustfmt, clippy
-          targets: x86_64-pc-windows-gnu
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --all -- --check
       - run: cargo clippy --locked --all-targets -- -D warnings
-      # The COM backend only compiles for Windows; check it from Linux too.
-      - run: cargo clippy --locked --all-targets --target x86_64-pc-windows-gnu -- -D warnings
-
-  test:
-    name: test (${{ matrix.os }})
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, windows-latest]
-    runs-on: ${{ matrix.os }}
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      # On Windows this includes the COM marshalling and policy tests, which
-      # use local IDispatch fixtures and need no Control Expert installation.
+      # Includes the COM marshalling and policy tests, which use local
+      # IDispatch fixtures and need no Control Expert installation.
       - run: cargo test --locked --all-targets
 
   msrv:
     name: MSRV (rust-version in Cargo.toml)
-    runs-on: ubuntu-latest
+    runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@1.90
-        with:
-          targets: x86_64-pc-windows-gnu
       - uses: Swatinem/rust-cache@v2
       - run: cargo check --locked --all-targets
-      - run: cargo check --locked --all-targets --target x86_64-pc-windows-gnu
