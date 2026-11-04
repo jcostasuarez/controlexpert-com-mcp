@@ -388,6 +388,10 @@ impl Server {
     }
 }
 #[rmcp::tool_handler]
+#[expect(
+    clippy::unused_async_trait_impl,
+    reason = "rmcp::tool_handler generates the async ServerHandler methods"
+)]
 impl ServerHandler for Server {
     fn get_info(&self) -> ServerConfig {
         ServerConfig::new(ServerCapabilities::builder().enable_tools().build())

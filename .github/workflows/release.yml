@@ -1,0 +1,76 @@
+name: Release
+
+# Push a tag such as v0.2.0 to publish a release. The tag must match the
+# version in Cargo.toml, and CHANGELOG.md must have a section for it.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+  RUST_TOOLCHAIN: "1.99"
+
+jobs:
+  release:
+    name: build and publish (x86_64-pc-windows-msvc)
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+
+      - name: Check the tag against Cargo.toml and CHANGELOG.md
+        id: meta
+        run: |
+          $tag = "${{ github.ref_name }}"
+          $version = (cargo metadata --no-deps --format-version 1 | ConvertFrom-Json).packages[0].version
+          if ($tag -ne "v$version") { throw "Tag $tag does not match Cargo.toml version $version" }
+          $notes = [System.Collections.Generic.List[string]]::new()
+          $inside = $false
+          foreach ($line in Get-Content CHANGELOG.md) {
+            if ($line -match '^## \[') {
+              if ($inside) { break }
+              $inside = $line -match "^## \[$([regex]::Escape($version))\]"
+              continue
+            }
+            # Skip the link reference definitions at the end of the file.
+            if ($inside -and $line -notmatch '^\[[^\]]+\]: ') { $notes.Add($line) }
+          }
+          if (-not $inside) { throw "CHANGELOG.md has no section for $version" }
+          ($notes -join "`n").Trim() | Set-Content -Encoding utf8 release-notes.md
+          "version=$version" >> $env:GITHUB_OUTPUT
+
+      - run: cargo test --locked --all-targets
+
+      - name: Build
+        # Static CRT: the executable does not need the Visual C++ runtime.
+        env:
+          RUSTFLAGS: -D warnings -C target-feature=+crt-static
+        run: cargo build --locked --release
+
+      - name: Package
+        id: package
+        run: |
+          $name = "controlexpert-com-mcp-v${{ steps.meta.outputs.version }}-x86_64-pc-windows-msvc"
+          New-Item -ItemType Directory $name | Out-Null
+          Copy-Item target/release/controlexpert-com-mcp.exe, README.md, CHANGELOG.md, LICENSE, mcp.json, codex-mcp.toml $name
+          Compress-Archive -Path $name -DestinationPath "$name.zip"
+          $hash = (Get-FileHash "$name.zip" -Algorithm SHA256).Hash.ToLower()
+          "$hash  $name.zip" | Set-Content -Encoding ascii "$name.zip.sha256"
+          "name=$name" >> $env:GITHUB_OUTPUT
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $name = "${{ steps.package.outputs.name }}"
+          gh release create "${{ github.ref_name }}" "$name.zip" "$name.zip.sha256" `
+            --title "${{ github.ref_name }}" --notes-file release-notes.md --verify-tag
