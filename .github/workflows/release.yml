@@ -1,13 +1,27 @@
 name: Release
 
-# Push a tag such as v0.2.0 to publish a release. The tag must match the
-# version in Cargo.toml, and CHANGELOG.md must have a section for it.
+# Two ways to publish a release. Either one needs the version in Cargo.toml
+# and a section for it in CHANGELOG.md.
+# - Run this workflow on main from the Actions tab (or the API). It creates the
+#   tag v<version> on that commit. With dry_run it builds and uploads the zip
+#   as a workflow artifact without creating a tag or a release.
+# - Push a tag such as v0.2.0; it must match the version in Cargo.toml.
 on:
   push:
     tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: Build and package only; do not create the tag or the release
+        type: boolean
+        default: false
 
 permissions:
   contents: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
 
 env:
   CARGO_TERM_COLOR: always
@@ -27,12 +41,19 @@ jobs:
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
 
-      - name: Check the tag against Cargo.toml and CHANGELOG.md
+      - name: Check the version, the tag and CHANGELOG.md
         id: meta
+        env:
+          DRY_RUN: ${{ inputs.dry_run }}
         run: |
-          $tag = "${{ github.ref_name }}"
           $version = (cargo metadata --no-deps --format-version 1 | ConvertFrom-Json).packages[0].version
-          if ($tag -ne "v$version") { throw "Tag $tag does not match Cargo.toml version $version" }
+          $tag = "v$version"
+          if ("${{ github.event_name }}" -eq "push") {
+            if ("${{ github.ref_name }}" -ne $tag) { throw "Tag ${{ github.ref_name }} does not match Cargo.toml version $version" }
+          } elseif ($env:DRY_RUN -ne "true") {
+            if ("${{ github.ref }}" -ne "refs/heads/main") { throw "Releases are published from main, not ${{ github.ref }}" }
+            if (git ls-remote --tags origin "refs/tags/$tag") { throw "Tag $tag already exists; bump the version in Cargo.toml" }
+          }
           $notes = [System.Collections.Generic.List[string]]::new()
           $inside = $false
           foreach ($line in Get-Content CHANGELOG.md) {
@@ -47,6 +68,7 @@ jobs:
           if (-not $inside) { throw "CHANGELOG.md has no section for $version" }
           ($notes -join "`n").Trim() | Set-Content -Encoding utf8 release-notes.md
           "version=$version" >> $env:GITHUB_OUTPUT
+          "tag=$tag" >> $env:GITHUB_OUTPUT
 
       - run: cargo test --locked --all-targets
 
@@ -67,10 +89,24 @@ jobs:
           "$hash  $name.zip" | Set-Content -Encoding ascii "$name.zip.sha256"
           "name=$name" >> $env:GITHUB_OUTPUT
 
+      - name: Upload the package (dry run)
+        if: ${{ inputs.dry_run }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.package.outputs.name }}
+          path: |
+            ${{ steps.package.outputs.name }}.zip
+            ${{ steps.package.outputs.name }}.zip.sha256
+            release-notes.md
+
       - name: Publish
+        if: ${{ !inputs.dry_run }}
         env:
           GH_TOKEN: ${{ github.token }}
+        # On a manual run the release creates the tag on this commit. A tag
+        # created with the workflow token does not start this workflow again.
         run: |
           $name = "${{ steps.package.outputs.name }}"
-          gh release create "${{ github.ref_name }}" "$name.zip" "$name.zip.sha256" `
-            --title "${{ github.ref_name }}" --notes-file release-notes.md --verify-tag
+          $tag = "${{ steps.meta.outputs.tag }}"
+          gh release create $tag "$name.zip" "$name.zip.sha256" `
+            --target "${{ github.sha }}" --title $tag --notes-file release-notes.md
